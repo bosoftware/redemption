@@ -39,4 +39,14 @@ RED_AUTO_TEST_CASE(TestExecutor)
       .on_timeout([](T ctx) { return ctx.exit_on_success(); })
       .on_exit([](A ctx, bool) { return ctx.exit_on_success(); })
     ;
+
+    executor.exec();
+
+    executor.initial_executor("1", 1, 2)
+      .on_action([](A ctx, int, int){ return ctx.exit_on_success(); })
+      .on_timeout([](T ctx, int, int) { return ctx.exit_on_success(); })
+      .on_exit([](A ctx, bool, int, int) { return ctx.exit_on_success(); })
+    ;
+
+    executor.exec();
 }

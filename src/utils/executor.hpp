@@ -23,8 +23,84 @@ Author(s): Jonathan Poelen
 #include <vector>
 #include <functional>
 #include <type_traits>
-#include <tuple>
 #include <cassert>
+
+namespace detail
+{
+    template<int...>
+    class seq_int;
+
+    template<class, class>
+    struct cat_seq;
+
+    template<int... i1, int... i2>
+    struct cat_seq<seq_int<i1...>, seq_int<i2...>>
+    {
+        using type = seq_int<i1..., sizeof...(i1)+i2...>;
+    };
+
+    template<int n>
+    struct make_seq_int_impl
+    : cat_seq<
+        typename make_seq_int_impl<n/2>::type,
+        typename make_seq_int_impl<n - n/2>::type
+    >{};
+
+    template<>
+    struct make_seq_int_impl<0>
+    {
+        using type = seq_int<>;
+    };
+
+    template<>
+    struct make_seq_int_impl<1>
+    {
+        using type = seq_int<0>;
+    };
+
+    template<int n>
+    using make_seq_int = typename make_seq_int_impl<n>::type;
+
+    template<class S, class... T>
+    class tuple_impl;
+
+    template<int, class T>
+    struct tuple_elem
+    {
+        T x;
+    };
+
+    template<int... ints, class... Ts>
+    struct tuple_impl<seq_int<ints...>, Ts...>
+    : tuple_elem<ints, Ts>...
+    {
+        template<class... Args>
+        tuple_impl(Args&&... args)
+        : tuple_elem<ints, Ts>{static_cast<Args&&>(args)}...
+        {}
+
+        tuple_impl(tuple_impl &&) = default;
+        tuple_impl(tuple_impl const &) = default;
+        tuple_impl& operator=(tuple_impl &&) = default;
+        tuple_impl& operator=(tuple_impl const &) = default;
+
+        template<class F, class... Args>
+        auto invoke(F && f, Args&&... args)
+        -> decltype(f(
+            static_cast<Args&&>(args)...,
+            static_cast<tuple_elem<ints, Ts>*>(nullptr)->x...
+        ))
+        {
+            return f(static_cast<Args&&>(args)..., static_cast<tuple_elem<ints, Ts>&>(*this).x...);
+        }
+    };
+
+    template<class... Ts>
+    using tuple = tuple_impl<make_seq_int<int(sizeof...(Ts))>, Ts...>;
+
+    template<class... Args>
+    using ctx_arg_type = detail::tuple<typename std::decay<Args>::type...>;
+}
 
 
 #define CXX_WARN_UNUSED_RESULT __attribute__((warn_unused_result))
@@ -35,32 +111,33 @@ class ExecutorResult;
 
 struct ExecutorEvent
 {
-    class any{};
+    class any {};
     struct real_deleter
     {
-        void (*deleter) (void*) = +[](void*){};
+        void (*deleter) (void*);
         void operator()(any* x) const
         {
             deleter(x);
         }
     };
     std::unique_ptr<any, real_deleter> ctx;
-    std::function<ExecutorResult(ExecutorActionContext)> on_action;
-    std::function<ExecutorResult(ExecutorTimeoutContext)> on_timeout;
-    std::function<ExecutorResult(ExecutorActionContext, bool success)> on_exit;
+    std::function<ExecutorResult(ExecutorActionContext, any&)> on_action;
+    std::function<ExecutorResult(ExecutorTimeoutContext, any&)> on_timeout;
+    std::function<ExecutorResult(ExecutorActionContext, bool success, any&)> on_exit;
 
     ExecutorEvent()
     {}
 
-    template<class... Args>
-    ExecutorEvent(Args&&... args)
-      : ExecutorEvent(any{}, std::make_tuple(static_cast<Args&&>(args)...))
+    template<class Ctx, class... Args>
+    ExecutorEvent(Ctx*, Args&&... args)
+      : ctx(
+          reinterpret_cast<any*>(new Ctx(static_cast<Args&&>(args)...)),
+          real_deleter{[](void* p){ delete static_cast<Ctx*>(p); }})
     {}
 
-private:
-    template<class T>
-    ExecutorEvent(any, T&& t)
-      : ctx(static_cast<T&&>(t), +[](void* p){ delete static_cast<T&>(p); })
+    template<class Ctx>
+    ExecutorEvent(Ctx*)
+      : ctx(reinterpret_cast<any*>(this), real_deleter{[](void*){ }})
     {}
 };
 
@@ -81,7 +158,8 @@ struct ExecutorResult
 
 class Executor;
 
-struct ExecutorEventInitializer
+template<class Ctx>
+struct EventInitializer
 {
     ExecutorEvent& executor_event;
     Executor& executor;
@@ -96,81 +174,87 @@ struct ExecutorEventInitializer
     void init_on_timeout(F&& f);
 };
 
-template<int i, bool Initial>
+template<class EventCtx, int i, bool Initial>
 struct SubExecutorImpl;
 
-template<class F, bool Initial, int i, int flag>
+template<class EventCtx, class F, bool Initial, int i, int flag>
 using NextSubExecutorImpl = typename std::enable_if<
     ((void)static_cast<F*>(nullptr), !(i & flag)),
-    SubExecutorImpl<i | flag, Initial>
+    SubExecutorImpl<EventCtx, i | flag, Initial>
 >::type;
 
-template<int i, bool Initial>
+template<class EventCtx, int i, bool Initial>
 struct SubExecutorImpl
 {
     template<class F>
-    CXX_WARN_UNUSED_RESULT NextSubExecutorImpl<F, Initial, i, 1/*0b001*/> on_action(F&& f) &&
+    CXX_WARN_UNUSED_RESULT
+    NextSubExecutorImpl<EventCtx, F, Initial, i, 1/*0b001*/>
+    on_action(F&& f) &&
     {
         this->event_initializer.init_on_action(static_cast<F&&>(f));
         return {this->event_initializer};
     }
 
     template<class F>
-    CXX_WARN_UNUSED_RESULT NextSubExecutorImpl<F, Initial, i, 2/*0b010*/> on_timeout(F&& f) &&
+    CXX_WARN_UNUSED_RESULT
+    NextSubExecutorImpl<EventCtx, F, Initial, i, 2/*0b010*/>
+    on_timeout(F&& f) &&
     {
         this->event_initializer.init_on_timeout(static_cast<F&&>(f));
         return {this->event_initializer};
     }
 
     template<class F>
-    CXX_WARN_UNUSED_RESULT NextSubExecutorImpl<F, Initial, i, 4/*0b100*/> on_exit(F&& f) &&
+    CXX_WARN_UNUSED_RESULT
+    NextSubExecutorImpl<EventCtx, F, Initial, i, 4/*0b100*/>
+    on_exit(F&& f) &&
     {
         this->event_initializer.init_on_exit(static_cast<F&&>(f));
         return {this->event_initializer};
     }
 
-    SubExecutorImpl(ExecutorEventInitializer event_initializer) noexcept
+    SubExecutorImpl(EventInitializer<EventCtx> event_initializer) noexcept
       : event_initializer(event_initializer)
     {}
 
 private:
-    ExecutorEventInitializer event_initializer;
+    EventInitializer<EventCtx> event_initializer;
 };
 
-#define MK_SubExecutorImpl(i, mem)                                           \
-    template<>                                                               \
-    struct SubExecutorImpl<i, false>                                         \
-    {                                                                        \
-        template<class F>                                                    \
-        CXX_WARN_UNUSED_RESULT ExecutorResult mem(F&& f) &&                  \
-        {                                                                    \
-            this->event_initializer.init_##mem(static_cast<F&&>(f));         \
-            return {ExecutorResult::SubExecutor, {}};                        \
-        }                                                                    \
-                                                                             \
-        SubExecutorImpl(ExecutorEventInitializer event_initializer) noexcept \
-        : event_initializer(event_initializer)                               \
-        {}                                                                   \
-                                                                             \
-    private:                                                                 \
-        ExecutorEventInitializer event_initializer;                          \
-    };                                                                       \
-                                                                             \
-    template<>                                                               \
-    struct SubExecutorImpl<i, true>                                          \
-    {                                                                        \
-        template<class F>                                                    \
-        void mem(F&& f) &&                                                   \
-        {                                                                    \
-            this->event_initializer.init_##mem(static_cast<F&&>(f));         \
-        }                                                                    \
-                                                                             \
-        SubExecutorImpl(ExecutorEventInitializer event_initializer) noexcept \
-        : event_initializer(event_initializer)                               \
-        {}                                                                   \
-                                                                             \
-    private:                                                                 \
-        ExecutorEventInitializer event_initializer;                          \
+#define MK_SubExecutorImpl(i, mem)                                             \
+    template<class EventCtx>                                                   \
+    struct SubExecutorImpl<EventCtx, i, false>                                 \
+    {                                                                          \
+        template<class F>                                                      \
+        CXX_WARN_UNUSED_RESULT ExecutorResult mem(F&& f) &&                    \
+        {                                                                      \
+            this->event_initializer.init_##mem(static_cast<F&&>(f));           \
+            return {ExecutorResult::SubExecutor, {}};                          \
+        }                                                                      \
+                                                                               \
+        SubExecutorImpl(EventInitializer<EventCtx> event_initializer) noexcept \
+        : event_initializer(event_initializer)                                 \
+        {}                                                                     \
+                                                                               \
+    private:                                                                   \
+        EventInitializer<EventCtx> event_initializer;                          \
+    };                                                                         \
+                                                                               \
+    template<class EventCtx>                                                   \
+    struct SubExecutorImpl<EventCtx, i, true>                                  \
+    {                                                                          \
+        template<class F>                                                      \
+        void mem(F&& f) &&                                                     \
+        {                                                                      \
+            this->event_initializer.init_##mem(static_cast<F&&>(f));           \
+        }                                                                      \
+                                                                               \
+        SubExecutorImpl(EventInitializer<EventCtx> event_initializer) noexcept \
+        : event_initializer(event_initializer)                                 \
+        {}                                                                     \
+                                                                               \
+    private:                                                                   \
+        EventInitializer<EventCtx> event_initializer;                          \
     }
 
 MK_SubExecutorImpl(6/*0b110*/, on_action);
@@ -179,63 +263,85 @@ MK_SubExecutorImpl(3/*0b011*/, on_exit);
 
 #undef MK_SubExecutorImpl
 
-template<class F, bool Initial, int i, int flag>
-using NextSubExecutorImpl = typename std::enable_if<
-    ((void)static_cast<F*>(nullptr), !(i & flag)),
-    SubExecutorImpl<i | flag, Initial>
->::type;
 
-
-template<bool Initial>
+template<class EventCtx, bool Initial>
 struct SetSubExecutor
 {
+    using SubExecutor = SubExecutorImpl<EventCtx, 0, Initial>;
+
     template<class F>
-    CXX_WARN_UNUSED_RESULT SubExecutorImpl<1/*0b001*/, Initial> on_action(F&& f) &&
+    CXX_WARN_UNUSED_RESULT
+    SubExecutorImpl<EventCtx, 1/*0b001*/, Initial>
+    on_action(F&& f) &&
     {
-        return SubExecutorImpl<0, Initial>{this->event_initializer}.on_action(static_cast<F&&>(f));
+        return SubExecutor{this->event_initializer}.on_action(static_cast<F&&>(f));
     }
 
     template<class F>
-    CXX_WARN_UNUSED_RESULT SubExecutorImpl<2/*0b010*/, Initial> on_timeout(F&& f) &&
+    CXX_WARN_UNUSED_RESULT
+    SubExecutorImpl<EventCtx, 2/*0b010*/, Initial>
+    on_timeout(F&& f) &&
     {
-        return SubExecutorImpl<0, Initial>{this->event_initializer}.on_timeout(static_cast<F&&>(f));
+        return SubExecutor{this->event_initializer}.on_timeout(static_cast<F&&>(f));
     }
 
     template<class F>
-    CXX_WARN_UNUSED_RESULT SubExecutorImpl<4/*0b100*/, Initial> on_exit(F&& f) &&
+    CXX_WARN_UNUSED_RESULT
+    SubExecutorImpl<EventCtx, 4/*0b100*/, Initial> on_exit(F&& f) &&
     {
-        return SubExecutorImpl<0, Initial>{this->event_initializer}.on_exit(static_cast<F&&>(f));
+        return SubExecutor{this->event_initializer}.on_exit(static_cast<F&&>(f));
     }
 
-    explicit SetSubExecutor(ExecutorEventInitializer event_initializer) noexcept
+    explicit SetSubExecutor(EventInitializer<EventCtx> event_initializer) noexcept
       : event_initializer(event_initializer)
     {}
 
 private:
-    ExecutorEventInitializer event_initializer;
+    EventInitializer<EventCtx> event_initializer;
 };
 
-using InitialSubExecutor = SetSubExecutor<true>;
-using SubExecutor = SetSubExecutor<false>;
+template<class EventCtx>
+using InitialSubExecutor = SetSubExecutor<EventCtx, true>;
 
+template<class EventCtx>
+using SubExecutor = SetSubExecutor<EventCtx, false>;
+
+template<class... Args>
+using MakeSubExecutor = SubExecutor<detail::ctx_arg_type<Args...>>;
+
+template<class... Args>
+using MakeInitialSubExecutor = InitialSubExecutor<detail::ctx_arg_type<Args...>>;
 
 struct Executor
 {
     template<class... Args>
-    CXX_WARN_UNUSED_RESULT InitialSubExecutor
+    CXX_WARN_UNUSED_RESULT
+    MakeInitialSubExecutor<Args...>
     initial_executor(const char * /*TODO name*/, Args&&... args)
     {
-        this->events.emplace_back(static_cast<Args&&>(args)...);
-        return InitialSubExecutor{{this->events.back(), *this}};
+        return MakeInitialSubExecutor<Args...>{
+            this->create_ctx_events(static_cast<Args&&>(args)...)};
     }
 
     bool exec();
 
 private:
-    CXX_WARN_UNUSED_RESULT SubExecutor sub_executor(const char * /*TODO name*/)
+    template<class... Args>
+    CXX_WARN_UNUSED_RESULT
+    MakeSubExecutor<Args...>
+    sub_executor(const char * /*TODO name*/, Args&&... args)
     {
-        this->events.emplace_back();
-        return SubExecutor{{this->events.back(), *this}};
+        return MakeSubExecutor<Args...>{
+            this->create_ctx_events(static_cast<Args&&>(args)...)};
+    }
+
+    template<class... Args>
+    EventInitializer<detail::ctx_arg_type<Args...>> create_ctx_events(Args&&... args)
+    {
+        using Ctx = detail::ctx_arg_type<Args...>;
+        Ctx * p;
+        this->events.emplace_back(p, static_cast<Args&&>(args)...);
+        return {this->events.back(), *this};
     }
 
     friend class ExecutorContext;
@@ -265,10 +371,13 @@ struct ExecutorContext
         return {ExecutorResult::ExitSuccess, {}};
     }
 
-    template<class F>
-    CXX_WARN_UNUSED_RESULT SubExecutor sub_executor(const char * name, F&& f)
+    template<class F, class... Args>
+    CXX_WARN_UNUSED_RESULT
+    MakeSubExecutor<Args...>
+    sub_executor(const char * name, F&& f, Args&&... args)
     {
-        return this->executor.sub_executor(name, static_cast<F&&>(f));
+        return this->executor.sub_executor(
+            name, static_cast<F&&>(f), static_cast<Args&&>(args)...);
     }
 
     explicit ExecutorContext(Executor& executor) noexcept
@@ -285,10 +394,9 @@ struct ExecutorTimeoutContext : ExecutorContext
     template<class F>
     CXX_WARN_UNUSED_RESULT ExecutorResult next_timeout(F&& f)
     {
-        return {
-            ExecutorResult::ReplaceTimeout,
-            {static_cast<F&&>(f), nullptr, nullptr}
-        };
+        auto event_initializer = this->executor.create_ctx_events();
+        event_initializer.init_on_timeout(static_cast<F&&>(f));
+        return {ExecutorResult::ReplaceTimeout, std::move(event_initializer.executor_event)};
     }
 
     template<class F>
@@ -307,10 +415,9 @@ struct ExecutorActionContext : ExecutorContext
     template<class F>
     CXX_WARN_UNUSED_RESULT ExecutorResult next_action(F&& f)
     {
-        return {
-            ExecutorResult::ReplaceAction,
-            {static_cast<F&&>(f), nullptr, nullptr}
-        };
+        auto event_initializer = this->executor.create_ctx_events();
+        event_initializer.init_on_action(static_cast<F&&>(f));
+        return {ExecutorResult::ReplaceAction, std::move(event_initializer.executor_event)};
     }
 
     template<class F>
@@ -328,7 +435,8 @@ bool Executor::exec()
 {
     auto process_exit = [this](bool status) {
         while (!this->events.empty()) {
-            ExecutorResult r = this->events.back().on_exit(ExecutorActionContext{*this}, status);
+            ExecutorResult r = this->events.back().on_exit(
+                ExecutorActionContext{*this}, status, *this->events.back().ctx);
             switch (r.process_function) {
                 case ExecutorResult::ExitSuccess:
                     status = true;
@@ -354,7 +462,8 @@ bool Executor::exec()
         }
     };
 
-    ExecutorResult r = this->events.back().on_action(ExecutorActionContext{*this});
+    ExecutorResult r = this->events.back().on_action(
+        ExecutorActionContext{*this}, *this->events.back().ctx);
     switch (r.process_function) {
         case ExecutorResult::ExitSuccess:
             process_exit(true);
@@ -374,20 +483,40 @@ bool Executor::exec()
     return !this->events.empty();
 }
 
+
+template<class Ctx>
 template<class F>
-void ExecutorEventInitializer::init_on_action(F&& f)
+void EventInitializer<Ctx>::init_on_action(F&& f)
 {
-    this->executor_event.on_action = static_cast<F&&>(f);
+    this->executor_event.on_action = [f](
+        ExecutorActionContext exec_ctx,
+        ExecutorEvent::any& any
+    ){
+        return reinterpret_cast<Ctx&>(any).invoke(f, exec_ctx);
+    };
 }
 
+template<class Ctx>
 template<class F>
-void ExecutorEventInitializer::init_on_exit(F&& f)
+void EventInitializer<Ctx>::init_on_exit(F&& f)
 {
-    this->executor_event.on_exit = static_cast<F&&>(f);
+    this->executor_event.on_exit = [f](
+        ExecutorActionContext exec_ctx,
+        bool success,
+        ExecutorEvent::any& any
+    ){
+        return reinterpret_cast<Ctx&>(any).invoke(f, exec_ctx, success);
+    };
 }
 
+template<class Ctx>
 template<class F>
-void ExecutorEventInitializer::init_on_timeout(F&& f)
+void EventInitializer<Ctx>::init_on_timeout(F&& f)
 {
-    this->executor_event.on_timeout = static_cast<F&&>(f);
+    this->executor_event.on_timeout = [f](
+        ExecutorTimeoutContext exec_ctx,
+        ExecutorEvent::any& any
+    ){
+        return reinterpret_cast<Ctx&>(any).invoke(f, exec_ctx);
+    };
 }

@@ -28,24 +28,22 @@
 #include "utils/executor.hpp"
 
 using R = ExecutorResult;
-using A = ExecutorActionContext;
-using T = ExecutorTimeoutContext;
 
 RED_AUTO_TEST_CASE(TestExecutor)
 {
     Executor executor;
     executor.initial_executor("1")
-      .on_action([](A ctx){ return ctx.exit_on_success(); })
-      .on_timeout([](T ctx) { return ctx.exit_on_success(); })
-      .on_exit([](A ctx, bool) { return ctx.exit_on_success(); })
+      .on_action([](auto ctx){ return ctx.exit_on_success(); })
+      .on_timeout([](auto ctx) { return ctx.exit_on_success(); })
+      .on_exit([](auto ctx, bool) { return ctx.exit_on_success(); })
     ;
 
     executor.exec();
 
     executor.initial_executor("1", 1, 2)
-      .on_action([](A ctx, int, int){ return ctx.exit_on_success(); })
-      .on_timeout([](T ctx, int, int) { return ctx.exit_on_success(); })
-      .on_exit([](A ctx, bool, int, int) { return ctx.exit_on_success(); })
+      .on_action([](auto ctx, int, int){ return ctx.exit_on_success(); })
+      .on_timeout([](auto ctx, int, int) { return ctx.exit_on_success(); })
+      .on_exit([](auto ctx, bool, int, int) { return ctx.exit_on_success(); })
     ;
 
     executor.exec();

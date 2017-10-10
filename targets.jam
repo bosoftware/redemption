@@ -3866,6 +3866,7 @@ test-run tests/utils/test_executor :
   $(REDEMPTION_TEST_PATH)/utils/test_executor.cpp
 :
   <covfile>src/utils/executor.hpp
+  <cxxflags>-std=c++14
 ;
 test-run tests/utils/test_fileutils :
   $(REDEMPTION_TEST_PATH)/utils/test_fileutils.cpp

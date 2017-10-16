@@ -61,19 +61,32 @@ namespace detail
     template<int n>
     using make_seq_int = typename make_seq_int_impl<n>::type;
 
-    template<class S, class... T>
-    class tuple_impl;
-
     template<int, class T>
     struct tuple_elem
     {
         T x;
     };
 
+    template<class Ints, class... Ts>
+    struct tuple_impl;
+
     template<int... ints, class... Ts>
     struct tuple_impl<seq_int<ints...>, Ts...>
-    : tuple_elem<ints, Ts>...
+    : private tuple_elem<ints, Ts>...
     {
+        template<class F, class... Args>
+        auto invoke(F && f, Args&&... args)
+        -> decltype(f(static_cast<Args&&>(args)..., *static_cast<Ts*>(nullptr)...))
+        {
+            return f(
+                static_cast<Args&&>(args)...,
+                static_cast<tuple_elem<ints, Ts>&>(*this).x...
+            );
+        }
+
+    protected:
+        using tuple_base = tuple_impl;
+
         template<class... Args>
         tuple_impl(Args&&... args)
         : tuple_elem<ints, Ts>{static_cast<Args&&>(args)}...
@@ -83,20 +96,22 @@ namespace detail
         tuple_impl(tuple_impl const &) = default;
         tuple_impl& operator=(tuple_impl &&) = default;
         tuple_impl& operator=(tuple_impl const &) = default;
-
-        template<class F, class... Args>
-        auto invoke(F && f, Args&&... args)
-        -> decltype(f(
-            static_cast<Args&&>(args)...,
-            static_cast<tuple_elem<ints, Ts>*>(nullptr)->x...
-        ))
-        {
-            return f(static_cast<Args&&>(args)..., static_cast<tuple_elem<ints, Ts>&>(*this).x...);
-        }
     };
 
+
     template<class... Ts>
-    using tuple = tuple_impl<make_seq_int<int(sizeof...(Ts))>, Ts...>;
+    struct tuple : tuple_impl<make_seq_int<int(sizeof...(Ts))>, Ts...>
+    {
+        template<class... Args>
+        tuple(Args&&... args)
+        : tuple::tuple_base{static_cast<Args&&>(args)...}
+        {}
+
+        tuple(tuple &&) = default;
+        tuple(tuple const &) = default;
+        tuple& operator=(tuple &&) = default;
+        tuple& operator=(tuple const &) = default;
+    };
 
     template<class... Args>
     using ctx_arg_type = detail::tuple<typename std::decay<Args>::type...>;
